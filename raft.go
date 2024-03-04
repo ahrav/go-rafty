@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -193,8 +192,7 @@ func (n *Node) startElection() {
 	fmt.Printf("node %v starting election in term %v\n", n.id, n.currentTerm)
 
 	// Send RequestVote RPCs to all other nodes.
-	var votesReceived atomic.Int32
-	votesReceived.Add(1) // Vote for self.
+	votesReceived := 1 // Vote for self.
 
 	for _, peerID := range n.peerIDs {
 		go func(peerID int) {
@@ -222,8 +220,8 @@ func (n *Node) startElection() {
 			}
 
 			if reply.Term == n.currentTerm && reply.VoteGranted {
-				votesReceived.Add(1)
-				if int(votesReceived.Load())*2 > len(n.peerIDs)+1 {
+				votesReceived++
+				if votesReceived*2 > len(n.peerIDs)+1 {
 					fmt.Printf("node %v wins election in term %v\n", n.id, n.currentTerm)
 					n.becomeLeader()
 					return
