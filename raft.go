@@ -5,14 +5,10 @@ import (
 	"math/rand"
 	"net"
 	"net/rpc"
+	"sort"
 	"sync"
 	"time"
 )
-
-type logEntry struct {
-	term    int
-	command any
-}
 
 type consensusState int
 
@@ -38,6 +34,17 @@ func (cs consensusState) String() string {
 	}
 }
 
+type logEntry struct {
+	term    int
+	command any
+}
+
+type commitEntry struct {
+	index   int // Index of log entry to commit.
+	command any // Command from client to commit.
+	term    int // Term of leader which created entry at which a client command is committed.
+}
+
 // Node is a representation of a raft node.
 type Node struct {
 	mu sync.Mutex
@@ -47,6 +54,12 @@ type Node struct {
 
 	server *Server
 
+	// channel where the node sends committed entries to the client.
+	commitChan chan<- commitEntry
+
+	// notifications channel for when a new commit is ready to be sent on the commitChan.
+	newCommitReadyChan chan struct{}
+
 	// Persistent state on all servers.
 	currentTerm int
 	votedFor    int
@@ -55,19 +68,33 @@ type Node struct {
 	// Volatile state on all servers.
 	state              consensusState
 	electionResetEvent time.Time
+	commitIndex        int
+	lastApplied        int
+
+	// Volatile state on leaders.
+	nextIndex  map[int]int // For each server, index of the next log entry to send to that server.
+	matchIndex map[int]int // For each server, index of highest log entry known to be replicated on server.
 }
 
 // NewNode returns a new raft node with the given id and peer ids. It also takes a ready channel
 // which is used to signal when the node is connected to the network and ready to start its state machine.
-func NewNode(id int, peerIDs []int, ready <-chan struct{}) *Node {
+func NewNode(id int, peerIDs []int, server *Server, ready <-chan struct{}, commitChan chan<- commitEntry) *Node {
 	n := &Node{
-		id:       id,
-		peerIDs:  peerIDs,
-		state:    follower,
-		votedFor: -1,
+		id:                 id,
+		peerIDs:            peerIDs,
+		server:             server,
+		state:              follower,
+		votedFor:           -1,
+		commitChan:         commitChan,
+		newCommitReadyChan: make(chan struct{}, 16),
+		commitIndex:        -1,
+		lastApplied:        -1,
+		nextIndex:          make(map[int]int),
+		matchIndex:         make(map[int]int),
 	}
 
 	go n.run(ready)
+	go n.commitChanDispatcher()
 
 	return n
 }
@@ -124,6 +151,45 @@ func (n *Node) shouldStopElectionTimer(timeout time.Duration) bool {
 	return false
 }
 
+// commitChanDispatcher sends committed entries to the commitChan. It uses the newCommitReadyChan to be notified
+// when a new commit is ready to be sent. It then calculates all the commits up to the latest index and sends them
+// on the commitChan.
+func (n *Node) commitChanDispatcher() {
+	for range n.newCommitReadyChan {
+		n.mu.Lock()
+		savedTerm := n.currentTerm
+		savedLastApplied := n.lastApplied
+		var entries []logEntry
+		if n.commitIndex > n.lastApplied {
+			// All new entries since the last applied entry.
+			entries = n.log[n.lastApplied+1 : n.commitIndex+1]
+		}
+		n.mu.Unlock()
+		fmt.Printf("commitChanDispatcher for node %v in term %v, entries %v, saveLastApplied %v\n", n.id, savedTerm, entries, savedLastApplied)
+
+		for i, entry := range entries {
+			n.commitChan <- commitEntry{index: n.lastApplied + i + 1, command: entry.command, term: entry.term}
+		}
+	}
+}
+
+// Submit submits a new command to the raft node. Clients use the commit channel passed into the constructor
+// of NewNode to be notified when the command is committed. This function returns true iff this node is the leader.
+// If it's not the leader, the client should retry the command on the new leader.
+func (n *Node) Submit(command any) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != leader {
+		return false
+	}
+
+	n.log = append(n.log, logEntry{term: n.currentTerm, command: command})
+	fmt.Printf("node %v received client command %v, appending to log as entry %v\n", n.id, command, len(n.log)-1)
+
+	return true
+}
+
 // Stop stops the node.
 func (n *Node) Stop() {
 	n.mu.Lock()
@@ -169,7 +235,9 @@ func (n *Node) RequestVote(args *RVArgs, reply *RVResult) error {
 		return nil
 	}
 
-	if n.votedFor == -1 || n.votedFor == args.CandidateID {
+	lastLogIndex, lastLogTerm := n.lastLogIndexAndTerm()
+	if (n.votedFor == -1 || n.votedFor == args.CandidateID) &&
+		(args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		n.votedFor = args.CandidateID
 		reply.Term = n.currentTerm
 		reply.VoteGranted = true
@@ -181,6 +249,15 @@ func (n *Node) RequestVote(args *RVArgs, reply *RVResult) error {
 	reply.Term = n.currentTerm
 	reply.VoteGranted = false
 	return nil
+}
+
+// lastLogIndexAndTerm returns the index and term of the last log entry.
+func (n *Node) lastLogIndexAndTerm() (int, int) {
+	if len(n.log) == 0 {
+		return -1, -1
+	}
+	idx := len(n.log) - 1
+	return idx, n.log[idx].term
 }
 
 // startElection starts a new election with this node as a candidate.
@@ -267,8 +344,9 @@ func (n *Node) becomeLeader() {
 }
 
 type AEArgs struct {
-	Term         int
-	LeaderID     int
+	Term     int
+	LeaderID int
+
 	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []logEntry
@@ -309,7 +387,37 @@ func (n *Node) AppendEntries(args *AEArgs, reply *AEResult) error {
 		fmt.Printf("node %v becoming follower in term %v\n", n.id, args.Term)
 		n.becomeFollower(args.Term)
 		n.electionResetEvent = time.Now()
-		reply.Success = true
+
+		// Check if our log contains an entry at PrevLogIndex whose term matches PrevLogTerm.
+		if args.PrevLogIndex == -1 || (args.PrevLogIndex < len(n.log) && n.log[args.PrevLogIndex].term == args.PrevLogTerm) {
+			reply.Success = true
+
+			// If an existing entry conflicts with a new one (same index but different terms),
+			// delete the existing entry and all that follow it.
+			logInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+
+			for logInsertIndex < len(n.log) && newEntriesIndex < len(args.Entries) {
+				if n.log[logInsertIndex].term != args.Entries[newEntriesIndex].term {
+					n.log = n.log[:logInsertIndex]
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+
+			// Append any new entries not already in the log.
+			if newEntriesIndex < len(args.Entries) {
+				n.log = append(n.log, args.Entries[newEntriesIndex:]...)
+			}
+
+			// Set commitIndex to the minimum of leaderCommit and the index of the last new entry.
+			if args.LeaderCommit > n.commitIndex {
+				n.commitIndex = min(args.LeaderCommit, len(n.log)-1)
+				fmt.Printf("node %v updated commitIndex to %v\n", n.id, n.commitIndex)
+				n.newCommitReadyChan <- struct{}{}
+			}
+		}
 	}
 	return nil
 }
@@ -326,9 +434,27 @@ func (n *Node) sendHeartbeats() {
 
 	// Send empty AppendEntries RPCs as heartbeats to all other nodes.
 	for _, peerID := range n.peerIDs {
-		args := AEArgs{Term: currentTerm, LeaderID: n.id}
 		go func(peerID int) {
+			n.mu.Lock()
+			nextIndex := n.nextIndex[peerID]
+			prevLogIndex := nextIndex - 1
+			prevLogTerm := -1
+			if prevLogIndex >= 0 {
+				prevLogTerm = n.log[prevLogIndex].term
+			}
+			entries := n.log[nextIndex:]
+
+			args := AEArgs{
+				Term:         currentTerm,
+				LeaderID:     n.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: n.commitIndex,
+			}
+			n.mu.Unlock()
 			fmt.Printf("node %v sending AppendEntries RPC to node %v\n", n.id, peerID)
+
 			var reply AEResult
 			// Send RPC.
 			if err := n.server.Call(peerID, "Node.AppendEntries", &args, &reply); err != nil {
@@ -344,7 +470,33 @@ func (n *Node) sendHeartbeats() {
 				n.becomeFollower(reply.Term)
 				return
 			}
+
+			if n.state == leader && n.currentTerm == reply.Term {
+				if reply.Success {
+					n.nextIndex[peerID] = nextIndex + len(entries)
+					n.matchIndex[peerID] = n.nextIndex[peerID] - 1
+					fmt.Printf("node %v updated nextIndex to %v and matchIndex to %v for node %v\n", n.id, n.nextIndex[peerID], n.matchIndex[peerID], peerID)
+					n.updateCommitIndex()
+				} else {
+					n.nextIndex[peerID]--
+				}
+			}
 		}(peerID)
+	}
+}
+
+func (n *Node) updateCommitIndex() {
+	// Update commitIndex to the highest index replicated on a majority of servers.
+	matchIndexes := make([]int, 0, len(n.matchIndex))
+	for _, matchIndex := range n.matchIndex {
+		matchIndexes = append(matchIndexes, matchIndex)
+	}
+	sort.Ints(matchIndexes)
+	N := matchIndexes[len(matchIndexes)/2]
+	if N > n.commitIndex && n.log[N].term == n.currentTerm {
+		n.commitIndex = N
+		fmt.Printf("node %v updated commitIndex to %v\n", n.id, n.commitIndex)
+		n.newCommitReadyChan <- struct{}{}
 	}
 }
 
